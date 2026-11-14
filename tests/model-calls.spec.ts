@@ -5,6 +5,7 @@
 import * as z from 'zod';
 import { Logger } from '@nestjs/common';
 import type { TestingModule } from '@nestjs/testing';
+import { APICallError } from 'ai';
 import {
   AiBudgetExceededError,
   AiConfigurationError,
@@ -17,10 +18,21 @@ import { createAi } from './support/module.js';
 
 const noWait = { attempts: 3, backoff: { delay: 0, jitter: 'none' as const } };
 
+function apiErrorWithHeaders(responseHeaders: Record<string, string>): APICallError {
+  return new APICallError({
+    message: 'The provider answered 429',
+    url: 'https://fake-provider.test/v1/messages',
+    requestBodyValues: {},
+    statusCode: 429,
+    responseHeaders,
+  });
+}
+
 describe('model calls', () => {
   let moduleRef: TestingModule | undefined;
 
   afterEach(async () => {
+    vi.useRealTimers();
     await moduleRef?.close();
     moduleRef = undefined;
   });
@@ -136,20 +148,103 @@ describe('model calls', () => {
       expect(model.calls).toHaveLength(2);
     });
 
-    it("waits for the provider's retry-after, and moves on when it asks for longer than backoff.maxDelay", async () => {
+    it("honors the provider's retry-after with object backoff and enforces maxDelay", async () => {
+      vi.useFakeTimers();
       const model = new FakeModel([providerError(429, { retryAfter: 0.05 }), 'after the wait']);
       const { moduleRef: ref, ai } = await createAi({ models: { default: model }, defaults: { retry: noWait } });
       moduleRef = ref;
 
-      const started = performance.now();
-      expect((await ai.generateText({ prompt: 'Hi' })).text).toBe('after the wait');
-      expect(performance.now() - started).toBeGreaterThanOrEqual(45);
+      const generation = ai.generateText({ prompt: 'Hi' });
+      await vi.advanceTimersByTimeAsync(49);
+      expect(model.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await generation).text).toBe('after the wait');
+      expect(model.calls).toHaveLength(2);
 
       const limited = new FakeModel([providerError(429, { retryAfter: 120 }), 'never']);
-      const error = (await ai
+      const limitedGeneration = ai
         .generateText({ model: limited, prompt: 'Hi', retry: { ...noWait, backoff: { delay: 0, maxDelay: '1s' } } })
-        .catch((e: unknown) => e)) as AiModelError;
+        .catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(0);
+      const error = (await limitedGeneration) as AiModelError;
       expect(error.attempts).toHaveLength(1);
+      expect(limited.calls).toHaveLength(1);
+    });
+
+    it.each([
+      { header: 'retry-after', error: providerError(429, { retryAfter: 0.05 }) },
+      { header: 'retry-after-ms', error: apiErrorWithHeaders({ 'retry-after-ms': '50' }) },
+    ])('honors $header ahead of function backoff', async ({ error }) => {
+      vi.useFakeTimers();
+      const model = new FakeModel([error, 'after the wait']);
+      const { moduleRef: ref, ai } = await createAi({ models: { default: model } });
+      moduleRef = ref;
+      const backoff = vi.fn(() => 0);
+
+      const generation = ai.generateText({ prompt: 'Hi', retry: { attempts: 2, backoff } });
+      await vi.advanceTimersByTimeAsync(49);
+      expect(model.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await generation).text).toBe('after the wait');
+      expect(backoff).not.toHaveBeenCalled();
+      expect(model.calls).toHaveLength(2);
+    });
+
+    it('uses function backoff when retry-after is invalid', async () => {
+      vi.useFakeTimers();
+      const model = new FakeModel([apiErrorWithHeaders({ 'retry-after': 'invalid' }), 'after the wait']);
+      const { moduleRef: ref, ai } = await createAi({ models: { default: model } });
+      moduleRef = ref;
+      const backoff = vi.fn(() => 25);
+
+      const generation = ai.generateText({ prompt: 'Hi', retry: { attempts: 2, backoff } });
+      await vi.advanceTimersByTimeAsync(24);
+      expect(model.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await generation).text).toBe('after the wait');
+      expect(backoff).toHaveBeenCalledOnce();
+      expect(model.calls).toHaveLength(2);
+    });
+
+    it('does not retry when retryIf returns false', async () => {
+      vi.useFakeTimers();
+      const model = new FakeModel([providerError(429, { retryAfter: 0.05 }), 'never']);
+      const { moduleRef: ref, ai } = await createAi({ models: { default: model } });
+      moduleRef = ref;
+      const backoff = vi.fn(() => 0);
+      const retryIf = vi.fn(() => false);
+
+      const generation = ai
+        .generateText({ prompt: 'Hi', retry: { attempts: 2, backoff, retryIf } })
+        .catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(await generation).toBeInstanceOf(AiModelError);
+      expect(retryIf).toHaveBeenCalledOnce();
+      expect(backoff).not.toHaveBeenCalled();
+      expect(model.calls).toHaveLength(1);
+    });
+
+    it('cancels function backoff without beginning another request', async () => {
+      vi.useFakeTimers();
+      const model = new FakeModel([providerError(503), 'never']);
+      const { moduleRef: ref, ai } = await createAi({ models: { default: model } });
+      moduleRef = ref;
+      const controller = new AbortController();
+      const backoff = vi.fn(() => 5_000);
+      const generation = ai.generateText({
+        prompt: 'Hi',
+        abortSignal: controller.signal,
+        retry: { attempts: 2, backoff },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(backoff).toHaveBeenCalledOnce();
+      expect(model.calls).toHaveLength(1);
+
+      const reason = new Error('retry delay cancelled');
+      controller.abort(reason);
+      await expect(generation).rejects.toBe(reason);
+      expect(model.calls).toHaveLength(1);
     });
 
     it('retries what retryIf says, and nothing with retry: false', async () => {

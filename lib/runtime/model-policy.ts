@@ -236,6 +236,10 @@ function retryPolicy(model: PolicyModel, retry: RetryOptions, namespace: string)
   const maxDelay =
     typeof backoff === 'object' && backoff.maxDelay !== undefined ? toMilliseconds(backoff.maxDelay, 'retry.backoff.maxDelay') : DEFAULT_BACKOFF.maxDelay;
   const retryIf = retry.retryIf ?? isRetryable;
+  const configuredBackoff = (attempt: number, error: unknown) =>
+    typeof backoff === 'function'
+      ? backoff(attempt, error)
+      : exponential(attempt, { ...DEFAULT_BACKOFF, ...backoff });
   return new RetryPolicy({
     name: `${nameOf(model, namespace)} retry`,
     attempts: retry.attempts ?? 3,
@@ -243,10 +247,7 @@ function retryPolicy(model: PolicyModel, retry: RetryOptions, namespace: string)
     // A provider that asks for a longer wait than the backoff allows: on to the fallback.
     retryIf: (error, attempt) =>
       !(error instanceof AiOutputError) && (retryAfter(error) ?? 0) <= maxDelay && retryIf(error, attempt),
-    backoff:
-      typeof backoff === 'function'
-        ? backoff
-        : (attempt, error) => retryAfter(error) ?? exponential(attempt, { ...DEFAULT_BACKOFF, ...backoff }),
+    backoff: (attempt, error) => retryAfter(error) ?? configuredBackoff(attempt, error),
   });
 }
 
