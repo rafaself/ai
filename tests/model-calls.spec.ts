@@ -190,6 +190,24 @@ describe('model calls', () => {
       expect(model.calls).toHaveLength(2);
     });
 
+    it('rejects a provider delay above the default maxDelay with function backoff', async () => {
+      vi.useFakeTimers();
+      const model = new FakeModel([providerError(429, { retryAfter: 31 }), 'never']);
+      const { moduleRef: ref, ai } = await createAi({ models: { default: model } });
+      moduleRef = ref;
+      const backoff = vi.fn(() => 0);
+
+      const generation = ai
+        .generateText({ prompt: 'Hi', retry: { attempts: 2, backoff } })
+        .catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const error = (await generation) as AiModelError;
+      expect(error.attempts).toHaveLength(1);
+      expect(backoff).not.toHaveBeenCalled();
+      expect(model.calls).toHaveLength(1);
+    });
+
     it('uses function backoff when retry-after is invalid', async () => {
       vi.useFakeTimers();
       const model = new FakeModel([apiErrorWithHeaders({ 'retry-after': 'invalid' }), 'after the wait']);
