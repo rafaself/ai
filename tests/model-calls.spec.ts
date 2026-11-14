@@ -18,7 +18,7 @@ import { createAi } from './support/module.js';
 
 const noWait = { attempts: 3, backoff: { delay: 0, jitter: 'none' as const } };
 
-function apiErrorWithHeaders(responseHeaders: Record<string, string>): APICallError {
+function providerErrorWithHeaders(responseHeaders: Record<string, string>): APICallError {
   return new APICallError({
     message: 'The provider answered 429',
     url: 'https://fake-provider.test/v1/messages',
@@ -173,7 +173,7 @@ describe('model calls', () => {
 
     it.each([
       { header: 'retry-after', error: providerError(429, { retryAfter: 0.05 }) },
-      { header: 'retry-after-ms', error: apiErrorWithHeaders({ 'retry-after-ms': '50' }) },
+      { header: 'retry-after-ms', error: providerErrorWithHeaders({ 'retry-after-ms': '50' }) },
     ])('honors $header ahead of function backoff', async ({ error }) => {
       vi.useFakeTimers();
       const model = new FakeModel([error, 'after the wait']);
@@ -210,7 +210,7 @@ describe('model calls', () => {
 
     it('uses function backoff when retry-after is invalid', async () => {
       vi.useFakeTimers();
-      const model = new FakeModel([apiErrorWithHeaders({ 'retry-after': 'invalid' }), 'after the wait']);
+      const model = new FakeModel([providerErrorWithHeaders({ 'retry-after': 'invalid' }), 'after the wait']);
       const { moduleRef: ref, ai } = await createAi({ models: { default: model } });
       moduleRef = ref;
       const backoff = vi.fn(() => 25);
